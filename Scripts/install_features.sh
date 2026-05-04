@@ -214,10 +214,6 @@ NEW_FILES=(
     # SiteAtlas — Models
     "Loop/Models/SiteAtlas/SiteAtlas_Models.swift"
 
-    # SiteAtlas — Resources
-    "Loop/Resources/SiteAtlas/BodyMapBack.png"
-    "Loop/Resources/SiteAtlas/BodyMapFront.png"
-
     # SiteAtlas — Services
     "Loop/Services/SiteAtlas/SiteAtlas_Coordinator.swift"
     "Loop/Services/SiteAtlas/SiteAtlas_FeatureFlags.swift"
@@ -490,6 +486,71 @@ install_new_files() {
     if [[ $failed -gt 0 ]]; then
         warn "$failed files failed to install"
     fi
+}
+
+# ─── Phase 4b: Install SiteAtlas Body Map Assets ─────────────────────────────
+
+install_body_map_assets() {
+    header "Phase 4b: Installing SiteAtlas body map assets"
+
+    pushd Loop > /dev/null
+
+    local assets_base="Loop/DerivedAssetsBase.xcassets"
+
+    # Pull the PNGs from the feature branch into a temp location
+    local tmp_front tmp_back
+    tmp_front=$(mktemp)
+    tmp_back=$(mktemp)
+
+    if git show "${FEATURE_REMOTE}/${FEATURE_LOOP_BRANCH}:Loop/Resources/SiteAtlas/BodyMapFront.png" > "$tmp_front" 2>/dev/null && \
+       git show "${FEATURE_REMOTE}/${FEATURE_LOOP_BRANCH}:Loop/Resources/SiteAtlas/BodyMapBack.png" > "$tmp_back" 2>/dev/null; then
+
+        # Create imageset directories
+        mkdir -p "$assets_base/BodyMapFront.imageset"
+        mkdir -p "$assets_base/BodyMapBack.imageset"
+
+        # Copy PNGs
+        cp "$tmp_front" "$assets_base/BodyMapFront.imageset/BodyMapFront.png"
+        cp "$tmp_back"  "$assets_base/BodyMapBack.imageset/BodyMapBack.png"
+
+        # Write Contents.json for each
+        cat > "$assets_base/BodyMapFront.imageset/Contents.json" << 'IMGEOF'
+{
+  "images" : [
+    {
+      "filename" : "BodyMapFront.png",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}
+IMGEOF
+
+        cat > "$assets_base/BodyMapBack.imageset/Contents.json" << 'IMGEOF'
+{
+  "images" : [
+    {
+      "filename" : "BodyMapBack.png",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}
+IMGEOF
+
+        success "Installed BodyMapFront + BodyMapBack imagesets into DerivedAssetsBase.xcassets"
+    else
+        warn "Could not retrieve body map PNGs from feature branch — SiteAtlas will use fallback icon"
+    fi
+
+    rm -f "$tmp_front" "$tmp_back"
+    popd > /dev/null
 }
 
 # ─── Phase 5: Patch Modified Files ───────────────────────────────────────────
@@ -945,6 +1006,176 @@ replace_app_icon() {
     fi
 }
 
+# ─── Phase 8b: Patch LoopKit (Therapy Help → LoopInsights) ───────────────────
+
+patch_loopkit() {
+    header "Phase 8b: Patching LoopKit for therapy help integration"
+
+    local dismiss_file="LoopKit/LoopKitUI/Extensions/Environment+Dismiss.swift"
+    local therapy_file="LoopKit/LoopKitUI/Views/Settings Editors/TherapySettingsView.swift"
+
+    if [[ ! -f "$dismiss_file" ]]; then
+        warn "Environment+Dismiss.swift not found at: $(pwd)/$dismiss_file"
+        warn "Skipping LoopKit patch"
+        return
+    fi
+
+    if [[ ! -f "$therapy_file" ]]; then
+        warn "TherapySettingsView.swift not found at: $(pwd)/$therapy_file"
+    fi
+
+    # 1. Add TherapyHelpDestination to Environment+Dismiss.swift (if not already present)
+    if ! grep -q "TherapyHelpDestination" "$dismiss_file"; then
+        cat >> "$dismiss_file" << 'LOOPKIT_EOF'
+
+// MARK: - Therapy Help Destination
+
+public struct TherapyHelpDestination {
+    public let view: AnyView?
+
+    public init(_ view: AnyView? = nil) {
+        self.view = view
+    }
+
+    public static let empty = TherapyHelpDestination()
+}
+
+private struct TherapyHelpDestinationKey: EnvironmentKey {
+    static let defaultValue = TherapyHelpDestination.empty
+}
+
+extension EnvironmentValues {
+    public var therapyHelpDestination: TherapyHelpDestination {
+        get { self[TherapyHelpDestinationKey.self] }
+        set { self[TherapyHelpDestinationKey.self] = newValue }
+    }
+}
+LOOPKIT_EOF
+        success "Added TherapyHelpDestination to Environment+Dismiss.swift"
+    else
+        info "TherapyHelpDestination already present — skipping"
+    fi
+
+    # 2. Patch Loop's SettingsView to inject therapyHelpDestination
+    local settings_file="Loop/Loop/Views/SettingsView.swift"
+    if [[ -f "$settings_file" ]] && ! grep -q "therapyHelpDestination" "$settings_file"; then
+        python3 - "$settings_file" << 'PYEOF'
+import sys
+
+filepath = sys.argv[1]
+with open(filepath, 'r') as f:
+    content = f.read()
+
+# Add .environment(\.therapyHelpDestination, ...) after .environment(\.insulinTintColor, ...)
+# No feature flag check — Option B always has all features installed
+old_line = '.environment(\\.insulinTintColor, self.insulinTintColor)'
+new_block = old_line + '''
+        .environment(\\.therapyHelpDestination,
+                     TherapyHelpDestination(AnyView(LoopInsights_SettingsView(dataStoresProvider: viewModel.loopInsightsDataStores)))
+        )'''
+
+if old_line in content:
+    content = content.replace(old_line, new_block, 1)
+    with open(filepath, 'w') as f:
+        f.write(content)
+    print("OK: Injected therapyHelpDestination into SettingsView")
+else:
+    print("FAIL: insulinTintColor line not found in SettingsView")
+    sys.exit(1)
+PYEOF
+        if [[ $? -eq 0 ]]; then
+            success "Patched SettingsView.swift with therapy help injection"
+        else
+            warn "Failed to patch SettingsView.swift therapy help"
+        fi
+    else
+        info "SettingsView therapy help already patched — skipping"
+    fi
+
+    # 3. Patch TherapySettingsView to use the environment key
+    if [[ -f "$therapy_file" ]] && ! grep -q "therapyHelpDestination" "$therapy_file"; then
+        python3 - "$therapy_file" << 'PYEOF'
+import sys
+
+filepath = sys.argv[1]
+with open(filepath, 'r') as f:
+    content = f.read()
+
+# Add environment property after @Environment(\.appName)
+old_env = '@Environment(\\.appName) private var appName'
+new_env = old_env + '\n    @Environment(\\.therapyHelpDestination) private var therapyHelpDestination'
+if old_env in content:
+    content = content.replace(old_env, new_env)
+    print("  appName environment property: injected OK")
+else:
+    print("  WARNING: appName environment not found — may already be patched")
+
+# Replace the supportSection to check for injected destination
+old_support = '''    private var supportSection: some View {
+        Section {
+            NavigationLink(destination: DemoPlaceHolderView(appName: appName)) {
+                HStack {
+                    Text("Get help with Therapy Settings", comment: "Support button for Therapy Settings")
+                        .foregroundColor(.primary)
+                    Spacer()
+                    Disclosure()
+                }
+            }
+        }
+        .contentShape(Rectangle())
+    }'''
+
+new_support = '''    private var supportSection: some View {
+        Section {
+            if let destination = therapyHelpDestination.view {
+                NavigationLink(destination: destination) {
+                    HStack {
+                        Text("Get help with Therapy Settings", comment: "Support button for Therapy Settings")
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Disclosure()
+                    }
+                }
+            } else {
+                NavigationLink(destination: DemoPlaceHolderView(appName: appName)) {
+                    HStack {
+                        Text("Get help with Therapy Settings", comment: "Support button for Therapy Settings")
+                            .foregroundColor(.primary)
+                        Spacer()
+                        Disclosure()
+                    }
+                }
+            }
+        }
+        .contentShape(Rectangle())
+    }'''
+
+if old_support in content:
+    content = content.replace(old_support, new_support)
+    with open(filepath, 'w') as f:
+        f.write(content)
+    print("OK: supportSection replaced")
+else:
+    print("FAIL: supportSection pattern not found in file")
+    # Show what's actually around supportSection for debugging
+    idx = content.find("private var supportSection")
+    if idx >= 0:
+        print(f"  Found 'supportSection' at offset {idx}")
+        print(f"  Context: {repr(content[idx:idx+120])}")
+    else:
+        print("  'supportSection' not found anywhere in file!")
+    sys.exit(1)
+PYEOF
+        if [[ $? -eq 0 ]]; then
+            success "Patched TherapySettingsView.swift for therapy help"
+        else
+            warn "Failed to patch TherapySettingsView.swift"
+        fi
+    else
+        info "TherapySettingsView already patched or not found — skipping"
+    fi
+}
+
 # ─── Phase 9: Validate & Cleanup ─────────────────────────────────────────────
 
 validate_installation() {
@@ -1128,11 +1359,13 @@ main() {
     update_omnible
     bump_version
     install_new_files
+    install_body_map_assets
     patch_modified_files
     patch_settings_view
     patch_loop_data_manager
     update_pbxproj
     replace_app_icon
+    patch_loopkit
     validate_installation
     cleanup
 }
